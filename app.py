@@ -15,11 +15,12 @@ load_dotenv()
 
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+import auth
 import db
 from deepseek_service import (
     get_ai_response,
@@ -66,9 +67,40 @@ class FinishRequest(BaseModel):
     session_id: int
 
 
+class LoginRequest(BaseModel):
+    password: str
+
+
 # ----------------------------------------------------------------------
 # 基础
 # ----------------------------------------------------------------------
+
+@app.post("/auth/login")
+def login(req: LoginRequest):
+    """密码登录（密码即账号）：666666 访客 / 071527 管理员"""
+    result = auth.login(req.password)
+    if not result:
+        raise HTTPException(status_code=401, detail="密码错误")
+    return result
+
+
+@app.post("/auth/logout")
+def logout(authorization: Optional[str] = Header(None)):
+    """登出：作废当前 token"""
+    token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    if token:
+        auth.logout(token)
+    return {"ok": True}
+
+
+def _require_admin(authorization: Optional[str] = Header(None)):
+    """依赖：仅管理员可调用（访客无法消耗 AI 额度）"""
+    role = auth.get_role_from_authorization(authorization)
+    if role != "admin":
+        raise HTTPException(status_code=403, detail="访客模式仅可浏览历史记录，无法开始面试")
+    return True
 
 @app.get("/test")
 def test_endpoint():
@@ -99,7 +131,7 @@ def _norm_level(level) -> int:
 
 
 @app.post("/interview/start")
-def start_interview(req: StartRequest):
+def start_interview(req: StartRequest, _: bool = Depends(_require_admin)):
     """创建面试会话，流式返回开场白。
     SSE 首个事件为会话信息：data: {"type":"session","session_id":1,"category":"tech",...}
     之后为开场白文本流。"""
@@ -143,7 +175,7 @@ def _clean_content(text: str) -> str:
 
 
 @app.post("/interview/ask")
-async def process_interview_step(req: AskRequest):
+async def process_interview_step(req: AskRequest, _: bool = Depends(_require_admin)):
     """面试对话。
     - 带 session_id：服务端持久化（历史以服务端为准，忽略传入 history）
     - 不带 session_id：兼容旧版无状态模式（使用传入 history，不落库）
@@ -191,7 +223,7 @@ async def process_interview_step(req: AskRequest):
 
 
 @app.post("/interview/finish")
-def finish_interview(req: FinishRequest):
+def finish_interview(req: FinishRequest, _: bool = Depends(_require_admin)):
     """结束面试并评分：AI 依据完整对话输出多维度评分，落库返回"""
     session = db.get_session(req.session_id)
     if not session:
